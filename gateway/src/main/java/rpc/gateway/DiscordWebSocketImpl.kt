@@ -23,15 +23,9 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlin.coroutines.CoroutineContext
-import kotlin.random.Random
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
-/**
- * Discord Gateway transport.
- *
- * Important: this class implements the Gateway protocol used by the application. It does not
- * provide an official Discord-supported mobile RPC integration.
- */
 open class DiscordWebSocketImpl(
     private val token: String,
     private val logger: Logger = NoOpLogger
@@ -41,9 +35,8 @@ open class DiscordWebSocketImpl(
     @Volatile
     private var websocket: DefaultClientWebSocketSession? = null
 
-    // Gateway sequence is nullable: Heartbeat must send JSON null before the first dispatch.
     @Volatile
-    private var sequence: Int? = null
+    private var sequence = 0
 
     @Volatile
     private var sessionId: String? = null
@@ -54,32 +47,22 @@ open class DiscordWebSocketImpl(
     @Volatile
     private var resumeGatewayUrl: String? = null
 
+    private var heartbeatJob: Job? = null
+
     @Volatile
     private var connected = false
 
     @Volatile
     private var heartbeatAcknowledged = true
 
-    @Volatile
-    private var latestPresence: Presence? = null
-
-    @Volatile
-    private var lastSentPresence: Presence? = null
-
-    @Volatile
-    private var connectionReady = CompletableDeferred<Unit>()
-
-    private var connectionJob: Job? = null
-    private var heartbeatJob: Job? = null
-
-    private val connectionMutex = Mutex()
     private val sendMutex = Mutex()
-    private val presenceMutex = Mutex()
 
-    private val client: HttpClient = HttpClient {
+    /** Signalled when the socket is authenticated (READY received). */
+    private val connectionReady = CompletableDeferred<Unit>()
+
+    private var client: HttpClient = HttpClient {
         install(WebSockets)
     }
-
     protected val json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
@@ -87,203 +70,153 @@ open class DiscordWebSocketImpl(
 
     private val job = SupervisorJob()
     override val coroutineContext: CoroutineContext
-        get() = job + Dispatchers.IO
+        get() = job + Dispatchers.Default
 
-    /** Starts one managed connection loop. Repeated calls do not create parallel sockets. */
     override suspend fun connect() {
-        connectionMutex.withLock {
-            if (connectionJob?.isActive == true) return
-            connectionJob = launch { connectionLoop() }
-        }
-    }
-
-    private suspend fun connectionLoop() {
-        var retryDelayMs = 1_000L
-
-        while (currentCoroutineContext().isActive) {
-            // Keep an incomplete readiness signal across failed handshakes. A new signal is
-            // created in finally only after a previously authenticated socket is lost.
-            val attemptReady = connectionReady
-            connected = false
-            lastSentPresence = null
-            heartbeatAcknowledged = true
-
-            var session: DefaultClientWebSocketSession? = null
+        coroutineContext.cancelChildren() // Cancel any previous connection attempts
+        launch {
             try {
+                logger.i("Gateway", "Connect called")
                 val url = resumeGatewayUrl ?: gatewayUrl
-                logger.i("Gateway", "Connecting to Gateway")
-                session = client.webSocketSession(url)
-                websocket = session
+                websocket = client.webSocketSession(url)
 
-                session.incoming.receiveAsFlow().collect { frame ->
-                    if (frame is Frame.Text) {
-                        onMessage(frame.readText())
+                // start receiving messages
+                websocket!!.incoming.receiveAsFlow()
+                    .collect {
+                        when (it) {
+                            is Frame.Text -> {
+                                val jsonString = it.readText()
+                                onMessage(jsonString)
+                            }
+                            else -> {}
+                        }
                     }
-                }
-
-                val reason = session.closeReason?.await()
-                val closeCode = reason?.code?.toInt() ?: -1
-                logger.w(
-                    "Gateway",
-                    "Closed with code: ${reason?.code}, reason: ${reason?.message}"
-                )
-
-                if (closeCode == 4006 || closeCode == 4007 || closeCode == 4009) {
-                    clearSession("Gateway close code $closeCode")
-                }
-
-                if (!isRecoverableCloseCode(closeCode)) {
-                    logger.e("Gateway", "Not reconnecting after close code $closeCode")
-                    return
-                }
-
-                val waitMs = if (closeCode == 4008) 5_000L else retryDelayMs
-                delay(waitMs)
-                retryDelayMs = (retryDelayMs * 2).coerceAtMost(60_000L)
-            } catch (e: CancellationException) {
-                throw e
+                handleClose()
             } catch (e: Exception) {
-                logger.e("Gateway", "Connection error: ${e.message ?: e::class.simpleName}")
-                delay(retryDelayMs)
-                retryDelayMs = (retryDelayMs * 2).coerceAtMost(60_000L)
-            } finally {
-                connected = false
-                heartbeatJob?.cancel()
-                heartbeatJob = null
-                if (websocket === session) websocket = null
-
-                // Wake senders so they switch to the next connection generation instead of
-                // continuing to regard the previous READY as valid.
-                if (connectionReady === attemptReady && attemptReady.isCompleted) {
-                    connectionReady = CompletableDeferred()
-                }
+                logger.e("Gateway", e.message ?: "")
+                close()
             }
         }
     }
 
-    /** Close codes for which opening a fresh Gateway connection is appropriate. */
-    private fun isRecoverableCloseCode(code: Int): Boolean =
-        code == -1 || code in setOf(4000, 4003, 4005, 4006, 4007, 4008, 4009) || code == 1001
+    /** Recoverable close codes where we should reconnect. */
+    private fun isRecoverableCloseCode(code: Int): Boolean {
+        return code in setOf(4000, 4001, 4002, 4003, 4005, 4007, 4009) || code in 1000..1001
+    }
 
-    private fun clearSession(reason: String) {
-        logger.w("Gateway", "Clearing resumable session: $reason")
-        sessionId = null
-        sequence = null
-        resumeGatewayUrl = null
+    private suspend fun handleClose() {
+        heartbeatJob?.cancel()
+        connected = false
+        val close = websocket?.closeReason?.await()
+        val closeCode = close?.code?.toInt() ?: -1
+        logger.w(
+            "Gateway", "Closed with code: ${close?.code}, " +
+                    "reason: ${close?.message}, " +
+                    "can_reconnect: ${isRecoverableCloseCode(closeCode)}"
+        )
+        if (isRecoverableCloseCode(closeCode)) {
+            delay(200.milliseconds)
+            connect()
+        } else
+            close()
     }
 
     private suspend fun onMessage(jsonString: String) {
         val payload = json.decodeFromString<Payload>(jsonString)
-        logger.d("Gateway", "Received op:${payload.op}, seq:${payload.s}, event:${payload.t}")
+        logger.d("Gateway", "Received op:${payload.op}, seq:${payload.s}, event :${payload.t}")
 
-        payload.s?.let { sequence = it }
-
+        payload.s?.let {
+            sequence = it
+        }
         when (payload.op) {
-            DISPATCH -> {
-                payload.handleDispatch(jsonString)
-                if (payload.t == "READY" || payload.t == "RESUMED") {
-                    sendLatestPresence()
-                }
-            }
+            DISPATCH -> payload.handleDispatch(jsonString)
             HEARTBEAT -> sendHeartBeat()
             RECONNECT -> reconnectWebSocket()
-            INVALID_SESSION -> handleInvalidSession(jsonString)
+            INVALID_SESSION -> handleInvalidSession()
             HELLO -> handleHello(jsonString)
             HEARTBEAT_ACK -> {
                 heartbeatAcknowledged = true
                 logger.d("Gateway", "Heartbeat ACK received")
             }
-            else -> Unit
+            else -> {}
         }
     }
 
     open fun Payload.handleDispatch(jsonString: String) {
-        when (this.t) {
+        when (this.t.toString()) {
             "READY" -> {
                 val ready = decodePayloadData<Ready>(jsonString) ?: return
                 sessionId = ready.sessionId
-                resumeGatewayUrl = ready.resumeGatewayUrl?.let {
-                    "${it.trimEnd('/')}/?v=10&encoding=json"
-                }
+                resumeGatewayUrl = ready.resumeGatewayUrl + "/?v=10&encoding=json"
+                logger.i("Gateway", "resume_gateway_url updated to $resumeGatewayUrl")
+                logger.i("Gateway", "session_id updated to $sessionId")
                 connected = true
                 connectionReady.complete(Unit)
-                logger.i("Gateway", "READY received; Gateway session authenticated")
+                return
             }
             "RESUMED" -> {
+                logger.i("Gateway", "Session Resumed")
                 connected = true
                 connectionReady.complete(Unit)
-                logger.i("Gateway", "Session resumed")
             }
+            else -> {}
         }
     }
 
-    private suspend fun handleInvalidSession(jsonString: String) {
-        val resumable = decodePayloadData<Boolean>(jsonString) ?: false
-        val canResume = resumable && !sessionId.isNullOrBlank() && sequence != null
-        val waitMs = Random.nextLong(1_000L, 5_001L)
-        logger.w("Gateway", "INVALID_SESSION (resumable=$resumable); retrying in ${waitMs}ms")
-        delay(waitMs)
-
-        if (!canResume) {
-            clearSession("INVALID_SESSION is not resumable")
-        }
-        // INVALID_SESSION requires a fresh Gateway connection. HELLO on that connection
-        // will select RESUME (when allowed) or IDENTIFY (when the session was cleared).
-        websocket?.close(CloseReason(4000, "INVALID_SESSION; reconnecting"))
+    private suspend inline fun handleInvalidSession() {
+        logger.i("Gateway", "Handling Invalid Session")
+        logger.d("Gateway", "Sending Identify after 150ms")
+        delay(150)
+        sendIdentify()
     }
 
-    private suspend fun handleHello(jsonString: String) {
-        heartbeatInterval = decodePayloadData<Heartbeat>(jsonString)?.heartbeatInterval ?: 0L
-        if (heartbeatInterval <= 0L) {
-            logger.e("Gateway", "HELLO contained an invalid heartbeat interval")
-            reconnectWebSocket()
-            return
-        }
-
-        startHeartbeatJob(heartbeatInterval)
-
-        if (!sessionId.isNullOrBlank() && sequence != null) {
+    private suspend inline fun handleHello(jsonString: String) {
+        if (sequence > 0 && !sessionId.isNullOrBlank()) {
             sendResume()
         } else {
             sendIdentify()
         }
+        heartbeatInterval = decodePayloadData<Heartbeat>(jsonString)?.heartbeatInterval ?: return
+        logger.i("Gateway", "Setting heartbeatInterval= $heartbeatInterval")
+        startHeartbeatJob(heartbeatInterval)
     }
 
-    protected inline fun <reified T> decodePayloadData(jsonString: String): T? =
-        json.decodeFromString<PayloadData<T>>(jsonString).d
+    protected inline fun <reified T> decodePayloadData(jsonString: String): T? {
+        return json.decodeFromString<PayloadData<T>>(jsonString).d
+    }
 
-    /** The d field must be a JSON integer or JSON null, never the strings "123" / "null". */
     private suspend fun sendHeartBeat() {
-        logger.d("Gateway", "Sending HEARTBEAT with seq: $sequence")
-        send(op = HEARTBEAT, d = sequence)
+        logger.i("Gateway", "Sending $HEARTBEAT with seq: $sequence")
+        send(
+            op = HEARTBEAT,
+            d = if (sequence == 0) "null" else sequence.toString(),
+        )
     }
 
-    private suspend fun reconnectWebSocket() {
-        logger.w("Gateway", "Gateway requested reconnect")
-        websocket?.close(CloseReason(4000, "Attempting to reconnect"))
+    private suspend inline fun reconnectWebSocket() {
+        websocket?.close(
+            CloseReason(
+                code = 4000,
+                message = "Attempting to reconnect"
+            )
+        )
     }
 
     private suspend fun sendIdentify() {
-        logger.i("Gateway", "Sending IDENTIFY")
-        send(op = IDENTIFY, d = token.toIdentifyPayload())
+        logger.i("Gateway", "Sending $IDENTIFY")
+        send(
+            op = IDENTIFY,
+            d = token.toIdentifyPayload()
+        )
     }
 
     private suspend fun sendResume() {
-        val currentSessionId = sessionId
-        val currentSequence = sequence
-        if (currentSessionId.isNullOrBlank() || currentSequence == null) {
-            logger.w("Gateway", "Cannot RESUME without session_id and sequence; sending IDENTIFY")
-            clearSession("Resume state incomplete")
-            sendIdentify()
-            return
-        }
-
-        logger.i("Gateway", "Sending RESUME")
+        logger.i("Gateway", "Sending $RESUME")
         send(
             op = RESUME,
             d = Resume(
-                seq = currentSequence,
-                sessionId = currentSessionId,
+                seq = sequence,
+                sessionId = sessionId,
                 token = token
             )
         )
@@ -293,113 +226,83 @@ open class DiscordWebSocketImpl(
         heartbeatJob?.cancel()
         heartbeatAcknowledged = true
         heartbeatJob = launch {
-            // Discord specifies an initial randomized delay to avoid synchronized heartbeats.
-            delay((interval * Random.nextDouble()).toLong())
+            // Per Discord spec: first heartbeat after interval * jitter
+            val jitter = Math.random()
+            delay((interval * jitter).toLong())
             while (isActive) {
                 if (!heartbeatAcknowledged) {
-                    logger.w("Gateway", "Heartbeat ACK missing; reconnecting")
+                    logger.w("Gateway", "No heartbeat ACK received — zombie connection detected, reconnecting")
                     reconnectWebSocket()
                     return@launch
                 }
-
                 heartbeatAcknowledged = false
-                if (!send(op = HEARTBEAT, d = sequence)) {
-                    logger.w("Gateway", "Heartbeat could not be sent; reconnecting")
-                    reconnectWebSocket()
-                    return@launch
-                }
+                sendHeartBeat()
                 delay(interval)
             }
         }
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
-    override fun isWebSocketConnected(): Boolean =
-        connected && websocket?.isActive == true
-
-    /** Returns false if there is no live socket or the frame could not be written. */
-    private suspend fun <T> send(op: OpCode, d: T?): Boolean = sendMutex.withLock {
-        val ws = websocket
-        if (ws == null || !ws.isActive) {
-            logger.w("Gateway", "Dropped outgoing opcode ${op.value}: WebSocket is not active")
-            return@withLock false
-        }
-
-        try {
-            val payload = json.encodeToString(OutgoingPayload(op = op, d = d))
-            ws.send(Frame.Text(payload))
-            true
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            logger.e("Gateway", "Failed to send opcode ${op.value}: ${e.message}")
-            false
-        }
+    override fun isWebSocketConnected(): Boolean {
+        return websocket?.incoming != null && websocket?.outgoing?.isClosedForSend == false
     }
 
-    private suspend fun awaitGatewayReady() {
-        withTimeout(30.seconds) {
-            while (currentCoroutineContext().isActive) {
-                val ready = connectionReady
-                ready.await()
-                if (ready === connectionReady && connected && websocket?.isActive == true) {
-                    return@withTimeout
-                }
+    private suspend inline fun <reified T> send(op: OpCode, d: T?) {
+        sendMutex.withLock {
+            if (websocket?.isActive == true) {
+                val payload = json.encodeToString(
+                    OutgoingPayload(
+                        op = op,
+                        d = d,
+                    )
+                )
+                websocket?.send(Frame.Text(payload))
             }
         }
     }
 
-    /** Sends only the newest queued Presence, once per authenticated connection. */
-    private suspend fun sendLatestPresence() {
-        presenceMutex.withLock {
-            val presence = latestPresence ?: return
-            if (!connected || websocket?.isActive != true || presence == lastSentPresence) return
-
-            if (send(op = PRESENCE_UPDATE, d = presence)) {
-                lastSentPresence = presence
-                logger.i("Gateway", "Presence frame written to WebSocket")
-            } else {
-                logger.w("Gateway", "Presence frame was not written; it will be retried after reconnect")
+    override fun close() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+        coroutineContext.cancelChildren()
+        resumeGatewayUrl = null
+        sessionId = null
+        connected = false
+        // Non-blocking close — schedule on a coroutine to avoid ANR
+        val ws = websocket
+        websocket = null
+        if (ws != null) {
+            CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
+                try {
+                    ws.close()
+                } catch (_: Exception) {
+                    // Already closed or failed — safe to ignore
+                }
+                try {
+                    client.close()
+                } catch (_: Exception) {
+                    // Safe to ignore
+                }
+                logger.e("Gateway", "Connection to gateway closed")
             }
         }
     }
 
     override suspend fun sendActivity(presence: Presence) {
-        latestPresence = presence
+        // Wait for socket to be connected to account with a timeout instead of busy-wait
         try {
-            awaitGatewayReady()
-            sendLatestPresence()
+            withTimeout(30.seconds) {
+                connectionReady.await()
+            }
         } catch (e: TimeoutCancellationException) {
-            logger.e("Gateway", "Timed out waiting for an authenticated Gateway connection")
+            logger.e("Gateway", "Timed out waiting for gateway connection")
+            return
         }
+        logger.i("Gateway", "Sending $PRESENCE_UPDATE")
+        send(
+            op = PRESENCE_UPDATE,
+            d = presence
+        )
     }
 
-    override fun close() {
-        connected = false
-        heartbeatJob?.cancel()
-        heartbeatJob = null
-        connectionJob?.cancel()
-        connectionJob = null
-        coroutineContext.cancelChildren()
-        connectionReady = CompletableDeferred()
-        clearSession("Client closed")
-        latestPresence = null
-        lastSentPresence = null
-
-        val ws = websocket
-        websocket = null
-        CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
-            try {
-                ws?.close()
-            } catch (_: Exception) {
-                // The socket may already be closed.
-            }
-            try {
-                client.close()
-            } catch (_: Exception) {
-                // Client may already be closed.
-            }
-            logger.i("Gateway", "Gateway client closed")
-        }
-    }
 }
