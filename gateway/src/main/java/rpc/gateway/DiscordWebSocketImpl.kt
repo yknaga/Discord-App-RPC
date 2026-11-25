@@ -87,6 +87,16 @@ open class DiscordWebSocketImpl(
     private var client: HttpClient = HttpClient {
         install(WebSockets)
     }
+
+    /**
+     * Set once [close] has closed [client]. A closed Ktor HttpClient can
+     * never be used again, so [connect] recreates it when this is true.
+     * Without this, the first presence clear (closeRPC) permanently broke
+     * reconnecting: relaunching the detected app afterwards could never
+     * establish a new Gateway connection on the same instance.
+     */
+    @Volatile
+    private var clientClosed = false
     protected val json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
@@ -99,6 +109,12 @@ open class DiscordWebSocketImpl(
     override suspend fun connect() {
         coroutineContext.cancelChildren() // Cancel any previous connection attempts
         resetConnectionSignals()
+        if (clientClosed) {
+            client = HttpClient {
+                install(WebSockets)
+            }
+            clientClosed = false
+        }
         launch {
             try {
                 logger.i("Gateway", "Connect called")
@@ -409,6 +425,11 @@ open class DiscordWebSocketImpl(
         val ws = websocket
         websocket = null
         if (ws != null) {
+            // Capture the client being closed and mark it synchronously, so a
+            // connect() that happens before this coroutine runs recreates a
+            // fresh client instead of reusing (and then losing) this one.
+            val closingClient = client
+            clientClosed = true
             CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
                 try {
                     ws.close()
@@ -416,7 +437,7 @@ open class DiscordWebSocketImpl(
                     // Already closed or failed — safe to ignore
                 }
                 try {
-                    client.close()
+                    closingClient.close()
                 } catch (_: Exception) {
                     // Safe to ignore
                 }
