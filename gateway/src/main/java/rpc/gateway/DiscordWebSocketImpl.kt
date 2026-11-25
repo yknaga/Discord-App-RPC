@@ -22,6 +22,12 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -142,7 +148,65 @@ open class DiscordWebSocketImpl(
         }
     }
 
+    /** Log only non-sensitive fields from presence/session dispatches. */
+    private fun primitiveValue(obj: JsonObject, key: String): String =
+        runCatching { obj[key]?.jsonPrimitive?.contentOrNull ?: "null" }
+            .getOrDefault("<invalid>")
+
+    private fun presenceActivitySummary(element: JsonElement): String = runCatching {
+        val activity = element.jsonObject
+        "name=${primitiveValue(activity, "name")}, " +
+            "type=${primitiveValue(activity, "type")}, " +
+            "applicationId=${primitiveValue(activity, "application_id")}, " +
+            "detailsPresent=${primitiveValue(activity, "details") !in setOf("null", "")}, " +
+            "statePresent=${primitiveValue(activity, "state") !in setOf("null", "") }"
+    }.getOrDefault("<invalid activity>")
+
+    private fun logPresenceDispatch(eventName: String, jsonString: String) {
+        if (eventName != "PRESENCE_UPDATE" && eventName != "SESSIONS_REPLACE") return
+        try {
+            val data = json.parseToJsonElement(jsonString).jsonObject["d"]
+            when (eventName) {
+                "PRESENCE_UPDATE" -> {
+                    val presence = data?.jsonObject ?: return
+                    val activities = runCatching {
+                        presence["activities"]?.jsonArray?.joinToString(separator = "; ") {
+                            presenceActivitySummary(it)
+                        } ?: "null"
+                    }.getOrDefault("<invalid activities>")
+                    logger.i(
+                        "Gateway",
+                        "Received PRESENCE_UPDATE data: status=${primitiveValue(presence, "status")}, " +
+                            "activities=[$activities]"
+                    )
+                }
+                "SESSIONS_REPLACE" -> {
+                    val sessions = data?.jsonArray ?: return
+                    logger.i("Gateway", "Received SESSIONS_REPLACE: sessionCount=${sessions.size}")
+                    sessions.forEachIndexed { index, element ->
+                        runCatching {
+                            val session = element.jsonObject
+                            val activities = session["activities"]?.jsonArray?.joinToString(separator = "; ") {
+                                presenceActivitySummary(it)
+                            } ?: "null"
+                            logger.i(
+                                "Gateway",
+                                "SESSIONS_REPLACE[$index]: status=${primitiveValue(session, "status")}, " +
+                                    "active=${primitiveValue(session, "active")}, activities=[$activities]"
+                            )
+                        }.onFailure {
+                            logger.w("Gateway", "SESSIONS_REPLACE[$index]: unable to summarize session")
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            logger.w("Gateway", "Unable to summarize $eventName: ${e::class.simpleName}")
+        }
+    }
+
     open fun Payload.handleDispatch(jsonString: String) {
+        logPresenceDispatch(this.t.toString(), jsonString)
         when (this.t.toString()) {
             "READY" -> {
                 val ready = decodePayloadData<Ready>(jsonString) ?: return
