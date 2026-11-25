@@ -66,6 +66,9 @@ open class DiscordWebSocketImpl(
     /** Signalled when the socket is authenticated (READY received). */
     private val connectionReady = CompletableDeferred<Unit>()
 
+    /** Signalled after Discord sends the initial session list. */
+    private val initialSessionSyncReceived = CompletableDeferred<Unit>()
+
     private var client: HttpClient = HttpClient {
         install(WebSockets)
     }
@@ -217,6 +220,9 @@ open class DiscordWebSocketImpl(
                 connected = true
                 connectionReady.complete(Unit)
                 return
+            }
+            "SESSIONS_REPLACE" -> {
+                initialSessionSyncReceived.complete(Unit)
             }
             "RESUMED" -> {
                 logger.i("Gateway", "Session Resumed")
@@ -381,6 +387,18 @@ open class DiscordWebSocketImpl(
             logger.e("Gateway", "Timed out waiting for gateway connection")
             return
         }
+
+        val sessionSyncReceived = withTimeoutOrNull(5.seconds) {
+            initialSessionSyncReceived.await()
+            true
+        } ?: false
+        if (sessionSyncReceived) {
+            logger.i("Gateway", "Initial session sync received; delaying first presence by 1 second")
+            delay(1.seconds)
+        } else {
+            logger.w("Gateway", "Initial session sync not received within 5 seconds; sending presence anyway")
+        }
+
         logger.i("Gateway", "Sending $PRESENCE_UPDATE")
         logger.d(
             "Gateway",
