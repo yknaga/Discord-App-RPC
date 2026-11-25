@@ -295,7 +295,7 @@ class RpcRPC(
                 )
             ),
             afk = false,
-            since = startTimestamps ?: System.currentTimeMillis(),
+            since = null,
             status = status
         )
         connectToWebSocket()
@@ -345,7 +345,7 @@ class RpcRPC(
                     )
                 ),
                 afk = false,
-                since = startTimestamps,
+                since = null,
                 status = this.status
             )
         )
