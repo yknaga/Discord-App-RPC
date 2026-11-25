@@ -18,6 +18,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.Test
 import kotlin.time.Duration.Companion.seconds
+import org.junit.Assume.assumeTrue
 
 class DiscordGatewayTest {
     @Test
@@ -40,9 +41,21 @@ class DiscordGatewayTest {
             }
 
         }
-        val gateway = DiscordWebSocketImpl(System.getenv("DISCORD_TOKEN"),logger)
-        gateway.connect()
-        delay(2.seconds)
-        assert(gateway.isWebSocketConnected())
+        val token = System.getenv("DISCORD_TOKEN")
+
+        assumeTrue(
+          "Skipping Gateway integration test: DISCORD_TOKEN is not configured",
+          !token.isNullOrBlank()
+        )
+
+        val gateway = DiscordWebSocketImpl(token!!, logger)
+
+        try {
+            gateway.connect()
+            delay(2.seconds)
+            assert(gateway.isWebSocketConnected())
+        } finally {
+            gateway.close()
+        }
     }
 }
