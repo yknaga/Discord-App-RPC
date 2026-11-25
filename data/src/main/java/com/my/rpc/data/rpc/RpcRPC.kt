@@ -294,7 +294,7 @@ class RpcRPC(
                     url = url
                 )
             ),
-            afk = true,
+            afk = false,
             since = startTimestamps ?: System.currentTimeMillis(),
             status = status
         )
@@ -344,7 +344,7 @@ class RpcRPC(
 
                     )
                 ),
-                afk = true,
+                afk = false,
                 since = startTimestamps,
                 status = this.status
             )
