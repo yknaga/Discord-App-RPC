@@ -15,4 +15,8 @@ dependencies {
     implementation (libs.coil)
     implementation (libs.activity.compose)
     implementation (libs.kotlinx.serialization.json)
+    // WebAuthn/passkey support for the Discord login WebView
+    implementation (libs.webkit)
+    implementation (libs.credentials)
+    implementation (libs.credentials.play.services.auth)
 }
