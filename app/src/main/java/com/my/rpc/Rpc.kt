@@ -13,6 +13,7 @@
 package com.my.rpc
 
 import android.annotation.SuppressLint
+import android.content.Intent
 import androidx.activity.ComponentActivity
 import androidx.activity.viewModels
 import androidx.compose.animation.ExperimentalAnimationApi
@@ -24,6 +25,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
 import com.google.accompanist.navigation.animation.AnimatedNavHost
 import com.google.accompanist.navigation.animation.rememberAnimatedNavController
 
@@ -113,6 +115,7 @@ internal fun ComponentActivity.Rpc(
             }
 
             animatedComposable(Routes.PROFILE) {
+                val context = LocalContext.current
                 var loggedIn by remember {
                     mutableStateOf(Prefs[Prefs.TOKEN, ""].isNotEmpty())
                 }
@@ -120,7 +123,18 @@ internal fun ComponentActivity.Rpc(
                     val viewModel by viewModels<UserViewModel>()
                     UserScreen(
                         state = viewModel.state.value,
-                        onBackPressed = navController::popBackStack
+                        onBackPressed = navController::popBackStack,
+                        onLogout = {
+                            // Stop a running RPC session that still uses
+                            // the token we just removed, then show login.
+                            context.stopService(
+                                Intent(
+                                    context,
+                                    com.my.rpc.feature_rpc_base.services.Rpc::class.java
+                                )
+                            )
+                            loggedIn = false
+                        }
                     )
                 } else {
                     LoginScreen(

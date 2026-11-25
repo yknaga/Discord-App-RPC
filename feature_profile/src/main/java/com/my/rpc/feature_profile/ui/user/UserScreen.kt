@@ -12,6 +12,8 @@
 
 package com.my.rpc.feature_profile.ui.user
 
+import android.webkit.CookieManager
+import android.webkit.WebStorage
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -25,6 +27,7 @@ import com.my.rpc.domain.model.user.User
 import com.my.rpc.feature_profile.ui.component.Logout
 import com.my.rpc.feature_profile.ui.component.ProfileCard
 import com.my.rpc.feature_profile.ui.component.ProfileNetworkError
+import com.my.rpc.preference.Prefs
 import com.my.rpc.resources.R
 import com.my.rpc.ui.components.BackButton
 import com.my.rpc.ui.components.shimmer.AnimatedShimmer
@@ -35,7 +38,8 @@ import kotlinx.coroutines.launch
 @Composable
 fun UserScreen(
     state: UserState,
-    onBackPressed: () -> Unit
+    onBackPressed: () -> Unit,
+    onLogout: () -> Unit = {}
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
@@ -90,13 +94,24 @@ fun UserScreen(
                                 withDismissAction = true
                             ).run {
                                 when (this) {
-                                    SnackbarResult.ActionPerformed -> try {
-                                        val runtime = Runtime.getRuntime()
-                                        // running shell command to clear data
-                                        // TODO replace with deleting directories and restarting the app to have multiple user accounts
-                                        runtime.exec("pm clear com.my.rpc")
-                                    } catch (e: Exception) {
-                                        e.printStackTrace()
+                                    SnackbarResult.ActionPerformed -> {
+                                        // `pm clear` cannot work from a normal app:
+                                        // it needs the signature/privileged
+                                        // CLEAR_APP_USER_DATA permission, so the
+                                        // shell command silently failed and the
+                                        // stored token was never removed.
+                                        // Clear the login state directly instead.
+                                        Prefs.clearUserSession()
+                                        // The login WebView keeps Discord's own
+                                        // session in cookies / local storage.
+                                        // Without clearing it, the next login
+                                        // would silently reuse the same account.
+                                        CookieManager.getInstance().apply {
+                                            removeAllCookies(null)
+                                            flush()
+                                        }
+                                        WebStorage.getInstance().deleteAllData()
+                                        onLogout()
                                     }
 
                                     SnackbarResult.Dismissed -> Unit

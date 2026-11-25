@@ -48,6 +48,19 @@ object Prefs {
         kv.removeValueForKey(key)
     }
 
+    /**
+     * Removes everything that identifies the currently logged-in Discord
+     * user, so the app returns to the logged-out state. Other preferences
+     * (theme, RPC settings, enabled apps, ...) are intentionally kept.
+     */
+    fun clearUserSession() {
+        remove(TOKEN)
+        remove(USER_ID)
+        remove(USER_DATA)
+        remove(USER_BIO)
+        remove(USER_NITRO)
+    }
+
     fun isAppEnabled(packageName: String?): Boolean {
         val apps = get(ENABLED_APPS, "[]")
         val enabledPackages: ArrayList<String> = Json.decodeFromString(apps)
