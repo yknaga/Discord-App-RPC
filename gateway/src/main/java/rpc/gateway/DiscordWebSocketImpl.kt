@@ -63,11 +63,26 @@ open class DiscordWebSocketImpl(
 
     private val sendMutex = Mutex()
 
-    /** Signalled when the socket is authenticated (READY received). */
-    private val connectionReady = CompletableDeferred<Unit>()
+    /**
+     * Signalled when the socket is authenticated (READY received).
+     *
+     * Recreated for every connection attempt (see [resetConnectionSignals]).
+     * Previously these were created once and stayed completed forever, so
+     * after the socket was lost, sendActivity() still believed the gateway
+     * was ready and send() dropped every PRESENCE_UPDATE with
+     * "socketPresent=false, socketActive=null".
+     */
+    @Volatile
+    private var connectionReady = CompletableDeferred<Unit>()
 
     /** Signalled after Discord sends the initial session list. */
-    private val initialSessionSyncReceived = CompletableDeferred<Unit>()
+    @Volatile
+    private var initialSessionSyncReceived = CompletableDeferred<Unit>()
+
+    private fun resetConnectionSignals() {
+        connectionReady = CompletableDeferred()
+        initialSessionSyncReceived = CompletableDeferred()
+    }
 
     private var client: HttpClient = HttpClient {
         install(WebSockets)
@@ -83,6 +98,7 @@ open class DiscordWebSocketImpl(
 
     override suspend fun connect() {
         coroutineContext.cancelChildren() // Cancel any previous connection attempts
+        resetConnectionSignals()
         launch {
             try {
                 logger.i("Gateway", "Connect called")
@@ -116,6 +132,7 @@ open class DiscordWebSocketImpl(
     private suspend fun handleClose() {
         heartbeatJob?.cancel()
         connected = false
+        resetConnectionSignals()
         val close = websocket?.closeReason?.await()
         val closeCode = close?.code?.toInt() ?: -1
         logger.w(
@@ -259,7 +276,7 @@ open class DiscordWebSocketImpl(
         logger.i("Gateway", "Sending $HEARTBEAT with seq: $sequence")
         send(
             op = HEARTBEAT,
-            d = if (sequence == 0) "null" else sequence.toString(),
+            d = if (sequence == 0) null else sequence,
         )
     }
 
@@ -312,20 +329,19 @@ open class DiscordWebSocketImpl(
         }
     }
 
-    @OptIn(ExperimentalCoroutinesApi::class)
     override fun isWebSocketConnected(): Boolean {
-        return websocket?.incoming != null && websocket?.outgoing?.isClosedForSend == false
+        return connected && websocket?.isActive == true
     }
 
-    private suspend inline fun <reified T> send(op: OpCode, d: T?) {
-        sendMutex.withLock {
+    private suspend inline fun <reified T> send(op: OpCode, d: T?): Boolean {
+        return sendMutex.withLock {
             val activeSocket = websocket
             if (activeSocket?.isActive != true) {
                 logger.w(
                     "Gateway",
                     "Skipping WebSocket send: op=$op, socketPresent=${activeSocket != null}, socketActive=${activeSocket?.isActive}"
                 )
-                return@withLock
+                return@withLock false
             }
 
             val payload = json.encodeToString(
@@ -370,6 +386,7 @@ open class DiscordWebSocketImpl(
             try {
                 activeSocket.send(Frame.Text(payload))
                 logger.i("Gateway", "WebSocket send completed: op=$op, payloadBytes=$payloadBytes")
+                true
             } catch (e: Exception) {
                 logger.e(
                     "Gateway",
@@ -383,6 +400,7 @@ open class DiscordWebSocketImpl(
     override fun close() {
         heartbeatJob?.cancel()
         heartbeatJob = null
+        resetConnectionSignals()
         coroutineContext.cancelChildren()
         resumeGatewayUrl = null
         sessionId = null
@@ -408,41 +426,65 @@ open class DiscordWebSocketImpl(
     }
 
     override suspend fun sendActivity(presence: Presence) {
-        // Wait for socket to be connected to account with a timeout instead of busy-wait
         try {
             withTimeout(30.seconds) {
+                // Wait until the *current* connection is authenticated. The
+                // ready signals are recreated whenever a connection drops or
+                // a new attempt starts, so this can no longer be satisfied by
+                // a READY that belonged to a dead socket.
                 connectionReady.await()
+
+                val sessionSyncReceived = withTimeoutOrNull(5.seconds) {
+                    initialSessionSyncReceived.await()
+                    true
+                } ?: false
+                if (sessionSyncReceived) {
+                    logger.i("Gateway", "Initial session sync received; delaying first presence by 1 second")
+                    delay(1.seconds)
+                } else {
+                    logger.w("Gateway", "Initial session sync not received within 5 seconds; sending presence anyway")
+                }
+
+                logger.i("Gateway", "Sending $PRESENCE_UPDATE")
+                logger.d(
+                    "Gateway",
+                    "Presence summary: status=${presence.status}, since=${presence.since}, " +
+                        "activities=${presence.activities?.joinToString(separator = "; ") { activity ->
+                            "name=${activity?.name}, type=${activity?.type}, applicationId=${activity?.applicationId}, " +
+                                "detailsPresent=${!activity?.details.isNullOrBlank()}, statePresent=${!activity?.state.isNullOrBlank()}"
+                        }}"
+                )
+
+                // If the socket died between READY and the actual send, do not
+                // drop the presence: wait for the next connection to become
+                // ready and send it there. The loop is bounded by the 30s
+                // timeout above; if no reconnect happens it ends with the
+                // timeout log instead of repeated "Skipping WebSocket send".
+                while (true) {
+                    val sent = try {
+                        send(
+                            op = PRESENCE_UPDATE,
+                            d = presence
+                        )
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        logger.w(
+                            "Gateway",
+                            "PRESENCE_UPDATE send failed (${e::class.simpleName}); will retry when reconnected"
+                        )
+                        false
+                    }
+                    if (sent) break
+                    delay(500.milliseconds)
+                    connectionReady.await()
+                }
+                logger.d("Gateway", "PRESENCE_UPDATE send() returned")
             }
         } catch (e: TimeoutCancellationException) {
             logger.e("Gateway", "Timed out waiting for gateway connection")
             return
         }
-
-        val sessionSyncReceived = withTimeoutOrNull(5.seconds) {
-            initialSessionSyncReceived.await()
-            true
-        } ?: false
-        if (sessionSyncReceived) {
-            logger.i("Gateway", "Initial session sync received; delaying first presence by 1 second")
-            delay(1.seconds)
-        } else {
-            logger.w("Gateway", "Initial session sync not received within 5 seconds; sending presence anyway")
-        }
-
-        logger.i("Gateway", "Sending $PRESENCE_UPDATE")
-        logger.d(
-            "Gateway",
-            "Presence summary: status=${presence.status}, since=${presence.since}, " +
-                "activities=${presence.activities?.joinToString(separator = "; ") { activity ->
-                    "name=${activity?.name}, type=${activity?.type}, applicationId=${activity?.applicationId}, " +
-                        "detailsPresent=${!activity?.details.isNullOrBlank()}, statePresent=${!activity?.state.isNullOrBlank()}"
-                }}"
-        )
-        send(
-            op = PRESENCE_UPDATE,
-            d = presence
-        )
-        logger.d("Gateway", "PRESENCE_UPDATE send() returned")
     }
 
 }

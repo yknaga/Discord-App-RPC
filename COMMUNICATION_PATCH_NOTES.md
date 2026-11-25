@@ -15,6 +15,23 @@ This patch focuses on the Discord Gateway transport and Rich Presence handling.
 - Clear invalid session state for close codes 4006, 4007, and 4009; use bounded exponential reconnect backoff and a longer wait for 4008.
 - Add serialization tests for Heartbeat sequence number and null payloads.
 
+## Presence send after disconnect fix (2026-11-25)
+
+### Fixed
+
+- Fixed `Skipping WebSocket send: op=PRESENCE_UPDATE, socketPresent=false, socketActive=null`:
+  the Gateway-ready signals (`connectionReady` / `initialSessionSyncReceived`) were created
+  once and stayed completed forever, so after the socket was lost, `sendActivity()` still
+  believed the gateway was ready and `send()` silently dropped every presence update.
+- The ready signals are now recreated on every connection attempt and whenever a
+  connection is lost or closed, so a READY from a dead socket no longer authorises sends.
+- `send()` now reports whether the frame was actually sent, and `sendActivity()` waits for
+  the next connection and retries the pending presence instead of dropping it (bounded by
+  the existing 30 second timeout).
+- `isWebSocketConnected()` now also requires the READY/RESUMED state, not just a live socket.
+- Heartbeat `d` is now actually sent as an integer / JSON `null` from `sendHeartBeat()`,
+  matching `HeartbeatPayloadTest` (previously the production path still sent a quoted string).
+
 ## Initial Presence fix (2026-11-25)
 
 ### Fixed
