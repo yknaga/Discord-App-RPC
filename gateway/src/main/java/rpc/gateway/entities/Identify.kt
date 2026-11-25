@@ -16,14 +16,26 @@ data class Identify(
     val token: String
 ){
     companion object {
-        fun String.toIdentifyPayload() = Identify(
+        /**
+         * Identify as the official Android app (os=Android,
+         * browser="Discord Android") so Discord classifies this session as
+         * mobile: other users see the phone status icon instead of the
+         * desktop one, and the session shows up as an Android device.
+         * Previously this claimed os=Windows / browser="Discord Client",
+         * which made the session look like the desktop app.
+         *
+         * [deviceName] is the device model reported to Discord; the
+         * Android call sites pass Build.MODEL. The gateway module is pure
+         * JVM, so it cannot read Build itself.
+         */
+        fun String.toIdentifyPayload(deviceName: String = "Android") = Identify(
             capabilities = 65,
             compress = false,
             largeThreshold = 100,
             properties = Properties(
-                browser = "Discord Client",
-                device = "ktor",
-                os = "Windows"
+                browser = "Discord Android",
+                device = deviceName,
+                os = "Android"
             ),
             token = this
         )

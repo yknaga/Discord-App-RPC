@@ -23,7 +23,7 @@ import rpc.gateway.entities.Payload
 import rpc.gateway.entities.Ready
 
 suspend fun getUserInfo(token: String, onInfoSaved: () -> Unit) {
-    val discordWebSocket: DiscordWebSocket = object: DiscordWebSocketImpl(token){
+    val discordWebSocket: DiscordWebSocket = object: DiscordWebSocketImpl(token, deviceName = android.os.Build.MODEL ?: "Android"){
         override fun Payload.handleDispatch(jsonString: String) {
             if (this.t.toString() == "READY"){
                 val user = decodePayloadData<Ready>(jsonString)?.user ?: return

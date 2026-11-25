@@ -33,7 +33,7 @@ object ServiceModule {
     fun providesDiscordWebsocket(
         logger: Logger
     ): DiscordWebSocket =
-        DiscordWebSocketImpl(Prefs[Prefs.TOKEN, ""], logger)
+        DiscordWebSocketImpl(Prefs[Prefs.TOKEN, ""], logger, deviceName = android.os.Build.MODEL ?: "Android")
 
     @Provides
     fun provideRpcRpc(

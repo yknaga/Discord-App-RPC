@@ -34,7 +34,8 @@ import kotlin.time.Duration.Companion.seconds
 
 open class DiscordWebSocketImpl(
     private val token: String,
-    private val logger: Logger = NoOpLogger
+    private val logger: Logger = NoOpLogger,
+    private val deviceName: String = "Android"
 ) : DiscordWebSocket {
     private val gatewayUrl = "wss://gateway.discord.gg/?v=10&encoding=json"
 
@@ -309,7 +310,7 @@ open class DiscordWebSocketImpl(
         logger.i("Gateway", "Sending $IDENTIFY")
         send(
             op = IDENTIFY,
-            d = token.toIdentifyPayload()
+            d = token.toIdentifyPayload(deviceName)
         )
     }
 
