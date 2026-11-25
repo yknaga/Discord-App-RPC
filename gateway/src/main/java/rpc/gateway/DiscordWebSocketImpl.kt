@@ -337,6 +337,36 @@ open class DiscordWebSocketImpl(
             val payloadBytes = payload.toByteArray(Charsets.UTF_8).size
             logger.d("Gateway", "WebSocket send started: op=$op, payloadBytes=$payloadBytes")
 
+            // Log the outgoing presence fields without exposing URLs or image references.
+            if (op == PRESENCE_UPDATE) {
+                runCatching {
+                    val data = json.parseToJsonElement(payload).jsonObject["d"]?.jsonObject
+                        ?: return@runCatching
+                    val activities = data["activities"]?.jsonArray?.joinToString(separator = "; ") { item ->
+                        item.jsonObject.entries.joinToString(separator = ", ") { (key, value) ->
+                            when (key) {
+                                "url" -> "urlPresent=${value.toString() != "null"}"
+                                "assets" -> "assetsKeys=${runCatching { value.jsonObject.keys }.getOrDefault(emptySet())}"
+                                "metadata" -> {
+                                    val metadata = runCatching { value.jsonObject }.getOrNull()
+                                    val count = runCatching { metadata?.get("button_urls")?.jsonArray?.size ?: 0 }.getOrDefault(-1)
+                                    "metadataKeys=${metadata?.keys ?: emptySet<String>()}, buttonUrlCount=$count"
+                                }
+                                else -> "$key=$value"
+                            }
+                        }
+                    } ?: "null"
+                    logger.i(
+                        "Gateway",
+                        "Outgoing PRESENCE_UPDATE payload: status=${primitiveValue(data, "status")}, " +
+                            "since=${primitiveValue(data, "since")}, afk=${primitiveValue(data, "afk")}, " +
+                            "activities=[$activities]"
+                    )
+                }.onFailure {
+                    logger.w("Gateway", "Unable to summarize outgoing PRESENCE_UPDATE: ${it::class.simpleName}")
+                }
+            }
+
             try {
                 activeSocket.send(Frame.Text(payload))
                 logger.i("Gateway", "WebSocket send completed: op=$op, payloadBytes=$payloadBytes")
