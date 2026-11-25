@@ -1,8 +1,8 @@
 # Communication patch notes
 
-This patch focuses on the Discord Gateway transport in `gateway/`.
+This patch focuses on the Discord Gateway transport and Rich Presence handling.
 
-## Changes
+## Gateway communication changes
 
 - Encode Gateway Heartbeat `d` as an integer or JSON `null`, not a quoted string.
 - Treat the Gateway sequence as nullable until the first dispatch.
@@ -15,11 +15,26 @@ This patch focuses on the Discord Gateway transport in `gateway/`.
 - Clear invalid session state for close codes 4006, 4007, and 4009; use bounded exponential reconnect backoff and a longer wait for 4008.
 - Add serialization tests for Heartbeat sequence number and null payloads.
 
+## Initial Presence fix (2026-11-25)
+
+### Fixed
+
+- Fixed an issue where the initial Rich Presence was not reflected in Discord after launching a game.
+- Normalize empty `state` and `details` strings to `null` when building the initial Presence payload.
+- Align the initial `build()` behavior with the `updateRPC()` behavior, which already filters out empty strings.
+- Add outgoing `PRESENCE_UPDATE` payload diagnostics to help investigate Gateway communication issues.
+
+### Verification
+
+- Confirmed on an Android device that the initial Presence for Endfield is reflected in Discord.
+- Confirmed that switching to another game (Our Notes) continues to update Presence correctly.
+- Verified that Discord returns the expected game activity in `SESSIONS_REPLACE` after the initial Presence update.
+
 ## Validation status
 
-The source changes and test source were reviewed statically. A Gradle compile/test could not be run in this environment because the Gradle 8.13 distribution was not cached and network access to `services.gradle.org` was unavailable.
+The initial Presence fix was verified through runtime testing on an Android device.
 
-This is not a verified runtime fix. Test the build and Gateway behavior with a test account and inspect logs before relying on it.
+The Gateway transport changes and serialization tests should still be validated with the relevant build and test environment.
 
 ## Important compatibility / policy note
 
