@@ -249,14 +249,33 @@ open class DiscordWebSocketImpl(
 
     private suspend inline fun <reified T> send(op: OpCode, d: T?) {
         sendMutex.withLock {
-            if (websocket?.isActive == true) {
-                val payload = json.encodeToString(
-                    OutgoingPayload(
-                        op = op,
-                        d = d,
-                    )
+            val activeSocket = websocket
+            if (activeSocket?.isActive != true) {
+                logger.w(
+                    "Gateway",
+                    "Skipping WebSocket send: op=$op, socketPresent=${activeSocket != null}, socketActive=${activeSocket?.isActive}"
                 )
-                websocket?.send(Frame.Text(payload))
+                return@withLock
+            }
+
+            val payload = json.encodeToString(
+                OutgoingPayload(
+                    op = op,
+                    d = d,
+                )
+            )
+            val payloadBytes = payload.toByteArray(Charsets.UTF_8).size
+            logger.d("Gateway", "WebSocket send started: op=$op, payloadBytes=$payloadBytes")
+
+            try {
+                activeSocket.send(Frame.Text(payload))
+                logger.i("Gateway", "WebSocket send completed: op=$op, payloadBytes=$payloadBytes")
+            } catch (e: Exception) {
+                logger.e(
+                    "Gateway",
+                    "WebSocket send failed: op=$op, error=${e::class.simpleName}, message=${e.message}"
+                )
+                throw e
             }
         }
     }
@@ -299,10 +318,19 @@ open class DiscordWebSocketImpl(
             return
         }
         logger.i("Gateway", "Sending $PRESENCE_UPDATE")
+        logger.d(
+            "Gateway",
+            "Presence summary: status=${presence.status}, since=${presence.since}, " +
+                "activities=${presence.activities?.joinToString(separator = "; ") { activity ->
+                    "name=${activity?.name}, type=${activity?.type}, applicationId=${activity?.applicationId}, " +
+                        "detailsPresent=${!activity?.details.isNullOrBlank()}, statePresent=${!activity?.state.isNullOrBlank()}"
+                }}"
+        )
         send(
             op = PRESENCE_UPDATE,
             d = presence
         )
+        logger.d("Gateway", "PRESENCE_UPDATE send() returned")
     }
 
 }
