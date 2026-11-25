@@ -273,8 +273,8 @@ class RpcRPC(
             activities = listOf(
                 Activity(
                     name = activityName,
-                    state = state?.sanitize(),
-                    details = details?.sanitize(),
+                    state = state?.takeIf { it.isNotEmpty() }?.sanitize(),
+                    details = details?.takeIf { it.isNotEmpty() }?.sanitize(),
                     party = party.takeIf { party != null },
                     type = type,
                     platform = platform?.sanitize(),
@@ -294,8 +294,8 @@ class RpcRPC(
                     url = url
                 )
             ),
-            afk = true,
-            since = startTimestamps ?: System.currentTimeMillis(),
+            afk = false,
+            since = null,
             status = status
         )
         connectToWebSocket()
@@ -344,8 +344,8 @@ class RpcRPC(
 
                     )
                 ),
-                afk = true,
-                since = startTimestamps,
+                afk = false,
+                since = null,
                 status = this.status
             )
         )

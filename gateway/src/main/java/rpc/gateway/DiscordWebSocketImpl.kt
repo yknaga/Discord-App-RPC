@@ -22,6 +22,12 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -59,6 +65,9 @@ open class DiscordWebSocketImpl(
 
     /** Signalled when the socket is authenticated (READY received). */
     private val connectionReady = CompletableDeferred<Unit>()
+
+    /** Signalled after Discord sends the initial session list. */
+    private val initialSessionSyncReceived = CompletableDeferred<Unit>()
 
     private var client: HttpClient = HttpClient {
         install(WebSockets)
@@ -142,7 +151,65 @@ open class DiscordWebSocketImpl(
         }
     }
 
+    /** Log only non-sensitive fields from presence/session dispatches. */
+    private fun primitiveValue(obj: JsonObject, key: String): String =
+        runCatching { obj[key]?.jsonPrimitive?.contentOrNull ?: "null" }
+            .getOrDefault("<invalid>")
+
+    private fun presenceActivitySummary(element: JsonElement): String = runCatching {
+        val activity = element.jsonObject
+        "name=${primitiveValue(activity, "name")}, " +
+            "type=${primitiveValue(activity, "type")}, " +
+            "applicationId=${primitiveValue(activity, "application_id")}, " +
+            "detailsPresent=${primitiveValue(activity, "details") !in setOf("null", "")}, " +
+            "statePresent=${primitiveValue(activity, "state") !in setOf("null", "") }"
+    }.getOrDefault("<invalid activity>")
+
+    private fun logPresenceDispatch(eventName: String, jsonString: String) {
+        if (eventName != "PRESENCE_UPDATE" && eventName != "SESSIONS_REPLACE") return
+        try {
+            val data = json.parseToJsonElement(jsonString).jsonObject["d"]
+            when (eventName) {
+                "PRESENCE_UPDATE" -> {
+                    val presence = data?.jsonObject ?: return
+                    val activities = runCatching {
+                        presence["activities"]?.jsonArray?.joinToString(separator = "; ") {
+                            presenceActivitySummary(it)
+                        } ?: "null"
+                    }.getOrDefault("<invalid activities>")
+                    logger.i(
+                        "Gateway",
+                        "Received PRESENCE_UPDATE data: status=${primitiveValue(presence, "status")}, " +
+                            "activities=[$activities]"
+                    )
+                }
+                "SESSIONS_REPLACE" -> {
+                    val sessions = data?.jsonArray ?: return
+                    logger.i("Gateway", "Received SESSIONS_REPLACE: sessionCount=${sessions.size}")
+                    sessions.forEachIndexed { index, element ->
+                        runCatching {
+                            val session = element.jsonObject
+                            val activities = session["activities"]?.jsonArray?.joinToString(separator = "; ") {
+                                presenceActivitySummary(it)
+                            } ?: "null"
+                            logger.i(
+                                "Gateway",
+                                "SESSIONS_REPLACE[$index]: status=${primitiveValue(session, "status")}, " +
+                                    "active=${primitiveValue(session, "active")}, activities=[$activities]"
+                            )
+                        }.onFailure {
+                            logger.w("Gateway", "SESSIONS_REPLACE[$index]: unable to summarize session")
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            logger.w("Gateway", "Unable to summarize $eventName: ${e::class.simpleName}")
+        }
+    }
+
     open fun Payload.handleDispatch(jsonString: String) {
+        logPresenceDispatch(this.t.toString(), jsonString)
         when (this.t.toString()) {
             "READY" -> {
                 val ready = decodePayloadData<Ready>(jsonString) ?: return
@@ -153,6 +220,9 @@ open class DiscordWebSocketImpl(
                 connected = true
                 connectionReady.complete(Unit)
                 return
+            }
+            "SESSIONS_REPLACE" -> {
+                initialSessionSyncReceived.complete(Unit)
             }
             "RESUMED" -> {
                 logger.i("Gateway", "Session Resumed")
@@ -249,14 +319,63 @@ open class DiscordWebSocketImpl(
 
     private suspend inline fun <reified T> send(op: OpCode, d: T?) {
         sendMutex.withLock {
-            if (websocket?.isActive == true) {
-                val payload = json.encodeToString(
-                    OutgoingPayload(
-                        op = op,
-                        d = d,
-                    )
+            val activeSocket = websocket
+            if (activeSocket?.isActive != true) {
+                logger.w(
+                    "Gateway",
+                    "Skipping WebSocket send: op=$op, socketPresent=${activeSocket != null}, socketActive=${activeSocket?.isActive}"
                 )
-                websocket?.send(Frame.Text(payload))
+                return@withLock
+            }
+
+            val payload = json.encodeToString(
+                OutgoingPayload(
+                    op = op,
+                    d = d,
+                )
+            )
+            val payloadBytes = payload.toByteArray(Charsets.UTF_8).size
+            logger.d("Gateway", "WebSocket send started: op=$op, payloadBytes=$payloadBytes")
+
+            // Log the outgoing presence fields without exposing URLs or image references.
+            if (op == PRESENCE_UPDATE) {
+                runCatching {
+                    val data = json.parseToJsonElement(payload).jsonObject["d"]?.jsonObject
+                        ?: return@runCatching
+                    val activities = data["activities"]?.jsonArray?.joinToString(separator = "; ") { item ->
+                        item.jsonObject.entries.joinToString(separator = ", ") { (key, value) ->
+                            when (key) {
+                                "url" -> "urlPresent=${value.toString() != "null"}"
+                                "assets" -> "assetsKeys=${runCatching { value.jsonObject.keys }.getOrDefault(emptySet())}"
+                                "metadata" -> {
+                                    val metadata = runCatching { value.jsonObject }.getOrNull()
+                                    val count = runCatching { metadata?.get("button_urls")?.jsonArray?.size ?: 0 }.getOrDefault(-1)
+                                    "metadataKeys=${metadata?.keys ?: emptySet<String>()}, buttonUrlCount=$count"
+                                }
+                                else -> "$key=$value"
+                            }
+                        }
+                    } ?: "null"
+                    logger.i(
+                        "Gateway",
+                        "Outgoing PRESENCE_UPDATE payload: status=${primitiveValue(data, "status")}, " +
+                            "since=${primitiveValue(data, "since")}, afk=${primitiveValue(data, "afk")}, " +
+                            "activities=[$activities]"
+                    )
+                }.onFailure {
+                    logger.w("Gateway", "Unable to summarize outgoing PRESENCE_UPDATE: ${it::class.simpleName}")
+                }
+            }
+
+            try {
+                activeSocket.send(Frame.Text(payload))
+                logger.i("Gateway", "WebSocket send completed: op=$op, payloadBytes=$payloadBytes")
+            } catch (e: Exception) {
+                logger.e(
+                    "Gateway",
+                    "WebSocket send failed: op=$op, error=${e::class.simpleName}, message=${e.message}"
+                )
+                throw e
             }
         }
     }
@@ -298,11 +417,32 @@ open class DiscordWebSocketImpl(
             logger.e("Gateway", "Timed out waiting for gateway connection")
             return
         }
+
+        val sessionSyncReceived = withTimeoutOrNull(5.seconds) {
+            initialSessionSyncReceived.await()
+            true
+        } ?: false
+        if (sessionSyncReceived) {
+            logger.i("Gateway", "Initial session sync received; delaying first presence by 1 second")
+            delay(1.seconds)
+        } else {
+            logger.w("Gateway", "Initial session sync not received within 5 seconds; sending presence anyway")
+        }
+
         logger.i("Gateway", "Sending $PRESENCE_UPDATE")
+        logger.d(
+            "Gateway",
+            "Presence summary: status=${presence.status}, since=${presence.since}, " +
+                "activities=${presence.activities?.joinToString(separator = "; ") { activity ->
+                    "name=${activity?.name}, type=${activity?.type}, applicationId=${activity?.applicationId}, " +
+                        "detailsPresent=${!activity?.details.isNullOrBlank()}, statePresent=${!activity?.state.isNullOrBlank()}"
+                }}"
+        )
         send(
             op = PRESENCE_UPDATE,
             d = presence
         )
+        logger.d("Gateway", "PRESENCE_UPDATE send() returned")
     }
 
 }
