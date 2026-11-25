@@ -251,6 +251,15 @@ class Rpc : Service() {
                     if (!isMediaSessionActive || !useMediaRpc) {
                         updatePresence(CommonRpc())
                     }
+                } else if (currentApp.name.isEmpty() && currentPackageName.isNotEmpty()) {
+                    // No app is in the foreground anymore (the detected app
+                    // was closed/stopped, or nothing is in the foreground).
+                    // Previously this case did nothing, so the presence of
+                    // the already-closed app kept being shown indefinitely.
+                    currentPackageName = ""
+                    if (!isMediaSessionActive || !useMediaRpc) {
+                        updatePresence(CommonRpc())
+                    }
                 }
                 delay(5000)
             }
