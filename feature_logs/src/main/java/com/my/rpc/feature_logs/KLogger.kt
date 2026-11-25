@@ -45,13 +45,24 @@ class KLogger: Logger {
     }
 
     private fun addToLog(level: LogLevel, tag: String, event: String) {
+        val log = LogEvent(level, tag, event, System.currentTimeMillis())
+
+        // Keep the in-app log buffer (maximum 300 entries).
         synchronized(logs) {
             if (logs.size >= 300) {
                 logs.removeAt(0)
             }
-            val log = LogEvent(level, tag, event, System.currentTimeMillis())
             logs.add(log)
         }
+
+        // Mirror the same event to Android Logcat.
+        val priority = when (level) {
+            LogLevel.INFO -> android.util.Log.INFO
+            LogLevel.DEBUG -> android.util.Log.DEBUG
+            LogLevel.WARN -> android.util.Log.WARN
+            LogLevel.ERROR -> android.util.Log.ERROR
+        }
+        android.util.Log.println(priority, "DiscordAppRPC", "[$tag] $event")
     }
 
     companion object {
