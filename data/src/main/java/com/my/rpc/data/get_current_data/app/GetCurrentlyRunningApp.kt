@@ -47,6 +47,12 @@ class GetCurrentlyRunningApp @Inject constructor(
     private var lastEventTime = 0L
     private var seeded = false
 
+    // Resolving an app's label goes through PackageManager on every call.
+    // The foreground app rarely changes between polls, so cache the last
+    // resolved result and reuse it while the same package stays foreground.
+    private var cachedPackageName: String? = null
+    private var cachedAppInfo: CommonRpc? = null
+
     operator fun invoke(beginTime: Long = System.currentTimeMillis() - 10000): CommonRpc {
         val usageStatsManager =
             context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
@@ -67,13 +73,19 @@ class GetCurrentlyRunningApp @Inject constructor(
         if (packageName == "com.my.rpc" || packageName == "com.discord") {
             return CommonRpc()
         }
-        return CommonRpc(
+        if (packageName == cachedPackageName) {
+            cachedAppInfo?.let { return it }
+        }
+        val appInfo = CommonRpc(
             name = context.getLauncherAppName(packageName).cleanAppName(),
             details = null,
             state = null,
             largeImage = RpcImage.ApplicationIcon(packageName, context),
             packageName = packageName
         )
+        cachedPackageName = packageName
+        cachedAppInfo = appInfo
+        return appInfo
     }
 
     /** Most recently used package according to the aggregated usage stats. */

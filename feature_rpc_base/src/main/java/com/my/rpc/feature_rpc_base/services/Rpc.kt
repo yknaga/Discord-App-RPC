@@ -16,8 +16,11 @@ import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
 import android.media.MediaMetadata
 import android.media.session.MediaController
@@ -27,6 +30,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import com.my.rpc.data.get_current_data.app.GetCurrentlyRunningApp
 import com.my.rpc.data.get_current_data.media.GetCurrentPlayingMediaAll
 import com.my.rpc.data.get_current_data.media.RichMediaMetadata
@@ -55,6 +59,12 @@ import kotlinx.serialization.json.Json
 import javax.inject.Inject
 
 private const val TAG = "RpcRPC"
+
+/** First app-detection poll interval; also the value a foreground change resets to. */
+private const val POLL_INTERVAL_MIN_MS = 5_000L
+
+/** Longest app-detection poll interval while the foreground app stays the same. */
+private const val POLL_INTERVAL_MAX_MS = 20_000L
 
 @Suppress("DEPRECATION")
 @AndroidEntryPoint
@@ -113,6 +123,23 @@ class Rpc : Service() {
     /** Tracked app detection job to prevent concurrent polling loops. */
     private var appDetectionJob: Job? = null
 
+    /** Foreground package currently shown as an app presence ("" when none). */
+    private var detectedPackageName = ""
+
+    /** True while the screen is off; app detection is paused in that state. */
+    private var isScreenOff = false
+
+    private var screenReceiverRegistered = false
+
+    private val screenStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> onScreenOff()
+                Intent.ACTION_SCREEN_ON -> onScreenOn()
+            }
+        }
+    }
+
     /** Whether notification actions have already been added for this lifecycle. */
     private var notificationActionsAdded = false
 
@@ -170,6 +197,9 @@ class Rpc : Service() {
                 ComponentName(this, NotificationListener::class.java)
             )
 
+            registerScreenStateReceiver()
+            isScreenOff = !(getSystemService(POWER_SERVICE) as PowerManager).isInteractive
+
             // Load all settings once and cache them
             reloadSettings()
 
@@ -226,42 +256,99 @@ class Rpc : Service() {
         cachedUseLowResIcon = Prefs[Prefs.RPC_USE_LOW_RES_ICON, false]
     }
 
+    private fun registerScreenStateReceiver() {
+        if (screenReceiverRegistered) return
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(screenStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(screenStateReceiver, filter)
+        }
+        screenReceiverRegistered = true
+    }
+
+    private fun onScreenOff() {
+        isScreenOff = true
+        appDetectionJob?.cancel()
+        appDetectionJob = null
+        // Locking the screen stops the foreground app, which the polling
+        // loop would normally notice and clear the presence for. The loop
+        // is stopped now, so clear it here instead. Media playback is not
+        // affected: it is event-driven and keeps its presence.
+        if (detectedPackageName.isNotEmpty()) {
+            detectedPackageName = ""
+            if (!isMediaSessionActive || !useMediaRpc) {
+                scope.launch { updatePresence(CommonRpc()) }
+            }
+        }
+    }
+
+    private fun onScreenOn() {
+        isScreenOff = false
+        if (useAppsRpc && !isMediaSessionActive) {
+            startAppDetectionCoroutine()
+        }
+    }
+
     private fun startAppDetectionCoroutine() {
+        // While the screen is off no app can come to the foreground, and
+        // onScreenOff() has already cleared the app presence. Polling in
+        // that state only drains battery; onScreenOn() restarts detection.
+        if (isScreenOff) {
+            logger.d(TAG, "Screen is off, not starting app detection")
+            return
+        }
         logger.d(TAG, "Starting app detection coroutine")
 
         // Cancel any existing app detection to prevent multiple concurrent loops
         appDetectionJob?.cancel()
 
-        var currentPackageName = ""
+        detectedPackageName = ""
         val startTimestamps = Timestamps(start = System.currentTimeMillis())
 
         appDetectionJob = scope.launch {
+            var pollIntervalMs = POLL_INTERVAL_MIN_MS
+            var lastPolledPackageName: String? = null
             while (isActive) {
                 val currentApp = getCurrentlyRunningApp()
 
                 if (
                     currentApp.name.isNotEmpty() &&
-                    currentApp.packageName != currentPackageName &&
+                    currentApp.packageName != detectedPackageName &&
                     enabledRpcApps.contains(currentApp.packageName)
                 ) {
-                    currentPackageName = currentApp.packageName
+                    detectedPackageName = currentApp.packageName
                     updatePresence(appInfo = currentApp.copy(time = startTimestamps))
-                } else if (currentApp.name.isNotEmpty() && currentApp.packageName != currentPackageName) {
-                    currentPackageName = ""
+                } else if (currentApp.name.isNotEmpty() && currentApp.packageName != detectedPackageName) {
+                    detectedPackageName = ""
                     if (!isMediaSessionActive || !useMediaRpc) {
                         updatePresence(CommonRpc())
                     }
-                } else if (currentApp.name.isEmpty() && currentPackageName.isNotEmpty()) {
+                } else if (currentApp.name.isEmpty() && detectedPackageName.isNotEmpty()) {
                     // No app is in the foreground anymore (the detected app
                     // was closed/stopped, or nothing is in the foreground).
                     // Previously this case did nothing, so the presence of
                     // the already-closed app kept being shown indefinitely.
-                    currentPackageName = ""
+                    detectedPackageName = ""
                     if (!isMediaSessionActive || !useMediaRpc) {
                         updatePresence(CommonRpc())
                     }
                 }
-                delay(5000)
+
+                // Back off while the foreground app stays the same
+                // (5s -> 10s -> 20s cap) instead of polling at full rate
+                // forever. Any foreground change resets to the minimum, so
+                // the next change is still picked up quickly.
+                pollIntervalMs = if (currentApp.packageName != lastPolledPackageName) {
+                    POLL_INTERVAL_MIN_MS
+                } else {
+                    (pollIntervalMs * 2).coerceAtMost(POLL_INTERVAL_MAX_MS)
+                }
+                lastPolledPackageName = currentApp.packageName
+                delay(pollIntervalMs)
             }
         }
     }
@@ -605,6 +692,14 @@ class Rpc : Service() {
 
     override fun onDestroy() {
         AppUtils.isRpcServiceRunning = false
+        if (screenReceiverRegistered) {
+            try {
+                unregisterReceiver(screenStateReceiver)
+            } catch (_: Exception) {
+                // Already unregistered; nothing to do
+            }
+            screenReceiverRegistered = false
+        }
         mediaSessionManager.removeOnActiveSessionsChangedListener(::activeSessionsListener)
         currentMediaController?.unregisterCallback(mediaControllerCallback)
         appDetectionJob?.cancel()
