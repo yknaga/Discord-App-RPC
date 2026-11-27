@@ -22,6 +22,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+import android.graphics.Bitmap
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
@@ -353,6 +354,23 @@ class Rpc : Service() {
         }
     }
 
+    /**
+     * Resets the foreground-service notification to its idle state.
+     * Called whenever a presence stops being sent, so the notification
+     * never keeps showing the title, text or large icon of a presence
+     * that is already gone (the builder is shared, so the icon from the
+     * last presence would otherwise survive every later build).
+     */
+    private fun resetNotificationToIdle() {
+        notificationManager.notify(
+            Constants.NOTIFICATION_ID, notificationBuilder
+                .setContentTitle(getString(R.string.service_enabled))
+                .setContentText(getString(R.string.idling_notification))
+                .setLargeIcon(null as Bitmap?)
+                .build()
+        )
+    }
+
     private suspend fun updatePresence(
         appInfo: CommonRpc? = null,
         richMediaInfo: RichMediaMetadata? = null,
@@ -380,12 +398,7 @@ class Rpc : Service() {
                 startAppDetectionCoroutine()
             } else if (rpcRPC.isRpcRunning()) {
                 rpcRPC.closeRPC()
-                notificationManager.notify(
-                    Constants.NOTIFICATION_ID, notificationBuilder
-                        .setContentTitle(getString(R.string.service_enabled))
-                        .setContentText(getString(R.string.idling_notification))
-                        .build()
-                )
+                resetNotificationToIdle()
             }
             return
         }
@@ -458,6 +471,9 @@ class Rpc : Service() {
             if (rpcRPC.isRpcRunning()) {
                 rpcRPC.closeRPC()
             }
+            // Nothing is being sent anymore, so the notification must not
+            // keep showing the last presence either.
+            resetNotificationToIdle()
             return
         }
 
@@ -468,12 +484,7 @@ class Rpc : Service() {
             if (rpcDataIsEmpty) {
                 logger.d(TAG, "Calculated RPC data is empty, stopping RPC.")
                 rpcRPC.closeRPC()
-                notificationManager.notify(
-                    Constants.NOTIFICATION_ID, notificationBuilder
-                        .setContentTitle(getString(R.string.service_enabled))
-                        .setContentText(getString(R.string.idling_notification))
-                        .build()
-                )
+                resetNotificationToIdle()
                 return
             }
 
@@ -496,13 +507,7 @@ class Rpc : Service() {
         } else {
             if (rpcDataIsEmpty) {
                 logger.d(TAG, "Calculated RPC data is empty, not starting RPC.")
-
-                notificationManager.notify(
-                    Constants.NOTIFICATION_ID, notificationBuilder
-                        .setContentTitle(getString(R.string.service_enabled))
-                        .setContentText(getString(R.string.idling_notification))
-                        .build()
-                )
+                resetNotificationToIdle()
                 return
             }
 
