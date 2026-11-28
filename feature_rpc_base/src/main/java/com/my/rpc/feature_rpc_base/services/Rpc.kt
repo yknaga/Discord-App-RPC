@@ -144,6 +144,14 @@ class Rpc : Service() {
     /** Whether notification actions have already been added for this lifecycle. */
     private var notificationActionsAdded = false
 
+    /**
+     * Whether the notification already shows the idle state. The app
+     * detection loop reaches the "no active context" path on every poll
+     * while a non-enabled app is in the foreground, so without this guard
+     * the idle notification would be re-posted every few seconds.
+     */
+    private var isNotificationIdle = false
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action.equals(Constants.ACTION_STOP_SERVICE)) {
             stopSelf()
@@ -313,6 +321,11 @@ class Rpc : Service() {
         appDetectionJob = scope.launch {
             var pollIntervalMs = POLL_INTERVAL_MIN_MS
             var lastPolledPackageName: String? = null
+            // Package for which the presence was already cleared. Without
+            // this, the "non-enabled app" branch below fired on every poll
+            // (detectedPackageName is "" while the foreground package is
+            // not), repeatedly calling updatePresence for no change.
+            var clearedForPackageName: String? = null
             while (isActive) {
                 val currentApp = getCurrentlyRunningApp()
 
@@ -322,11 +335,15 @@ class Rpc : Service() {
                     enabledRpcApps.contains(currentApp.packageName)
                 ) {
                     detectedPackageName = currentApp.packageName
+                    clearedForPackageName = null
                     updatePresence(appInfo = currentApp.copy(time = startTimestamps))
                 } else if (currentApp.name.isNotEmpty() && currentApp.packageName != detectedPackageName) {
                     detectedPackageName = ""
-                    if (!isMediaSessionActive || !useMediaRpc) {
-                        updatePresence(CommonRpc())
+                    if (currentApp.packageName != clearedForPackageName) {
+                        clearedForPackageName = currentApp.packageName
+                        if (!isMediaSessionActive || !useMediaRpc) {
+                            updatePresence(CommonRpc())
+                        }
                     }
                 } else if (currentApp.name.isEmpty() && detectedPackageName.isNotEmpty()) {
                     // No app is in the foreground anymore (the detected app
@@ -334,6 +351,7 @@ class Rpc : Service() {
                     // Previously this case did nothing, so the presence of
                     // the already-closed app kept being shown indefinitely.
                     detectedPackageName = ""
+                    clearedForPackageName = null
                     if (!isMediaSessionActive || !useMediaRpc) {
                         updatePresence(CommonRpc())
                     }
@@ -362,6 +380,8 @@ class Rpc : Service() {
      * last presence would otherwise survive every later build).
      */
     private fun resetNotificationToIdle() {
+        if (isNotificationIdle) return
+        isNotificationIdle = true
         notificationManager.notify(
             Constants.NOTIFICATION_ID, notificationBuilder
                 .setContentTitle(getString(R.string.service_enabled))
@@ -536,6 +556,7 @@ class Rpc : Service() {
         val notifTitle = finalName.takeIf { !it.isNullOrEmpty() } ?: getString(R.string.app_name)
         val notifText = finalDetails ?: finalState
 
+        isNotificationIdle = false
         notificationManager.notify(
             Constants.NOTIFICATION_ID, notificationBuilder
                 .setContentTitle(notifTitle)

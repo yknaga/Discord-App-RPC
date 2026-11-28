@@ -55,6 +55,11 @@ object RpcBaseModule {
             setShowBadge(false)
         }
         notificationManager.createNotificationChannel(channel)
+        // Ongoing: while the service runs, its notification is not meant
+        // to be swiped away. (Android 14+ still lets the user dismiss a
+        // foreground-service notification; it then returns on the next
+        // presence update.)
         return Notification.Builder(context, Constants.CHANNEL_ID)
+            .setOngoing(true)
     }
 }
